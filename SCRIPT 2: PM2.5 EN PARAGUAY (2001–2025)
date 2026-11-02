@@ -1,0 +1,458 @@
+// ============================================================
+// SCRIPT 2: PM2.5 EN PARAGUAY (2001–2025)
+// Fuentes según informe Sección 6.3, 7.2 y referencias 141–146:
+//   A) ACAG (van Donkelaar et al.) — Annual PM2.5 1998–2022 (V6)
+//   B) CAMS Reanalysis EAC4 — 2003–2024 (Inness et al. 2019)
+//   C) Sentinel-5P TROPOMI — desde 2018 (Veefkind et al. 2012)
+//   D) MERRA-2 — NASA Modern-Era Retrospective Analysis
+// Ecorregiones: Olson et al. (2001) — 5 ecorregiones de Paraguay
+// Período: 2001-01-01 al 2025-12-31 (según disponibilidad por fuente)
+// ============================================================
+
+// ─────────────────────────────────────────────────────────────
+// 1. ÁREA DE ESTUDIO
+// ─────────────────────────────────────────────────────────────
+var paraguay = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+  .filter(ee.Filter.eq('country_na', 'Paraguay'));
+
+var aoi = paraguay.geometry().buffer(10000);
+
+Map.centerObject(aoi, 6);
+Map.addLayer(paraguay, {color: 'black'}, 'Paraguay (límite)');
+
+// ─────────────────────────────────────────────────────────────
+// 2. ECORREGIONES OLSON et al. (2001)
+// ─────────────────────────────────────────────────────────────
+var ecoregions = ee.FeatureCollection('RESOLVE/ECOREGIONS/2017')
+  .filterBounds(aoi)
+  .filter(ee.Filter.inList('ECO_ID', [
+    'NT1301', // Chaco Seco
+    'NT0907', // Chaco Húmedo
+    'NT0704', // Cerrado
+    'NT0102', // Bosque Atlántico del Alto Paraná
+    'NT0139'  // Pantanal
+  ]));
+
+Map.addLayer(ecoregions.style({fillColor: '00000000', color: 'gray', width: 1}),
+  {}, 'Ecorregiones Olson 2001');
+
+// ─────────────────────────────────────────────────────────────
+// 3. PERÍODO DE ANÁLISIS
+// ─────────────────────────────────────────────────────────────
+var startYear = 2001;
+var endYear   = 2025;
+var startDate = ee.Date.fromYMD(startYear, 1, 1);
+var endDate   = ee.Date.fromYMD(endYear,   12, 31);
+
+// Paleta PM2.5 (µg/m³) — OMS: 5 µg/m³ anual (guía 2021)
+var pm25Palette = ['#00e400','#ffff00','#ff7e00','#ff0000','#8f3f97','#7e0023'];
+
+// ─────────────────────────────────────────────────────────────
+// 4A. ACAG — Annual PM2.5 Surface Concentration
+//     van Donkelaar et al. (2021) V6.GL.02
+//     GEE Asset: projects/sat-io/open-datasets/ACAG/PM25-annual
+//     Resolución: ~1 km anual | Período en GEE: 1998–2022
+//     Unidades: µg/m³ (media anual ponderada por población)
+//     Referencia informe: Sección 6.3, ref. 145–146
+// ─────────────────────────────────────────────────────────────
+var acag = ee.ImageCollection('projects/sat-io/open-datasets/ACAG/PM25-annual')
+  .filterDate('2001-01-01', '2022-12-31')
+  .filterBounds(aoi);
+
+// Serie temporal anual ACAG
+var acagAnnual = acag.map(function(img) {
+  var year = ee.Number(img.get('system:index')).toInt();
+  var stats = img.clip(aoi).reduceRegion({
+    reducer: ee.Reducer.mean().combine({
+      reducer2: ee.Reducer.stdDev(),
+      sharedInputs: true
+    }),
+    geometry: aoi,
+    scale: 1000,
+    maxPixels: 1e13
+  });
+  return ee.Feature(null, {
+    'year': year,
+    'pm25_mean_ug_m3': stats.get('b1_mean'),
+    'pm25_sd_ug_m3': stats.get('b1_stdDev'),
+    'source': 'ACAG_V6'
+  });
+});
+print('ACAG — PM2.5 anual medio Paraguay (2001–2022):', acagAnnual);
+
+// Mapa PM2.5 promedio ACAG (2001–2022)
+var acagMean = acag.mean().clip(aoi);
+Map.addLayer(acagMean,
+  {min: 0, max: 35, palette: pm25Palette},
+  'PM2.5 promedio ACAG 2001–2022 (µg/m³)');
+
+// ─────────────────────────────────────────────────────────────
+// 4B. CAMS REANALYSIS EAC4 — PM2.5 (Copernicus)
+//     Inness et al. (2019) — Atmos Chem Phys 19:3515–3556
+//     GEE Asset: ECMWF/CAMS/NRT  o  ECMWF/CAMS/REANALYSIS
+//     Banda: particulate_matter_d_less_than_25_um_surface
+//     Resolución: ~0.75° (~80 km) | Período: 2003–presente
+//     Referencia informe: Sección 6.3, ref. 141–142
+// ─────────────────────────────────────────────────────────────
+var cams = ee.ImageCollection('ECMWF/CAMS/NRT')
+  .filterDate('2016-06-21', endDate)  // disponibilidad NRT en GEE
+  .filterBounds(aoi)
+  .select('particulate_matter_d_less_than_25_um_surface');
+
+// Conversión: kg/m³ → µg/m³ (×1e9)
+var camsUg = cams.map(function(img) {
+  return img.multiply(1e9).rename('pm25_ug_m3')
+    .copyProperties(img, ['system:time_start', 'system:time_end']);
+});
+
+// Media anual CAMS
+var camsAnnual = ee.List.sequence(2017, endYear).map(function(year) {
+  var y = ee.Number(year);
+  var col = camsUg.filter(ee.Filter.calendarRange(y, y, 'year'));
+  var mean = col.mean().clip(aoi);
+  var stats = mean.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 10000,
+    maxPixels: 1e13
+  });
+  return ee.Feature(null, {
+    'year': y,
+    'pm25_mean_ug_m3': stats.get('pm25_ug_m3'),
+    'source': 'CAMS_NRT'
+  });
+});
+print('CAMS NRT — PM2.5 anual medio Paraguay (2017–2025):', camsAnnual);
+
+// Mapa PM2.5 CAMS promedio
+var camsMean = camsUg.mean().clip(aoi);
+Map.addLayer(camsMean,
+  {min: 0, max: 25, palette: pm25Palette},
+  'PM2.5 promedio CAMS NRT 2017–2025 (µg/m³)');
+
+// ─────────────────────────────────────────────────────────────
+// 4C. SENTINEL-5P TROPOMI — AER_AI + NO2 (proxy PM2.5)
+//     Veefkind et al. (2012) — Remote Sens Environ 120:70–83
+//     GEE: COPERNICUS/S5P/OFFL/L3_AER_AI  (Aerosol Index)
+//          COPERNICUS/S5P/OFFL/L3_NO2 (dióxido de nitrógeno)
+//     Período en GEE: desde 2018-07-04
+//     Resolución: ~3.5 km
+//     Referencia informe: Sección 6.3, ref. 143–144
+//     NOTA: S5P no mide PM2.5 directamente; el Aerosol Index
+//           (UVAI) es indicador cualitativo de aerosoles absorbentes
+// ─────────────────────────────────────────────────────────────
+var s5p_aer = ee.ImageCollection('COPERNICUS/S5P/OFFL/L3_AER_AI')
+  .filterDate('2018-07-04', endDate)
+  .filterBounds(aoi)
+  .select('absorbing_aerosol_index');
+
+// Índice de aerosoles absorbentes anual
+var aerAnnual = ee.List.sequence(2019, endYear).map(function(year) {
+  var y = ee.Number(year);
+  var col = s5p_aer.filter(ee.Filter.calendarRange(y, y, 'year'));
+  var mean = col.mean().clip(aoi);
+  var stats = mean.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 3500,
+    maxPixels: 1e13
+  });
+  return ee.Feature(null, {
+    'year': y,
+    'aerosol_index_mean': stats.get('absorbing_aerosol_index'),
+    'source': 'S5P_TROPOMI'
+  });
+});
+print('Sentinel-5P — Índice de aerosol anual Paraguay (2019–2025):', aerAnnual);
+
+// Mapa Aerosol Index S5P promedio
+var aerMean = s5p_aer.mean().clip(aoi);
+Map.addLayer(aerMean,
+  {min: -1, max: 3, palette: ['blue','white','orange','red']},
+  'Índice Aerosol Absorbente S5P TROPOMI 2018–2025');
+
+// ─────────────────────────────────────────────────────────────
+// 4D. MERRA-2 — NASA Modern-Era Retrospective Analysis
+//     Gelaro et al. (2017) — J Climate 30:5419–5454
+//     GEE: NASA/GSFC/MERRA/flx/2 (flujos superficie)
+//     Banda: BCSMASS + DUSMASS25 + OCSMASS + SO4SMASS + SSSMASS
+//            (componentes PM2.5 en kg/m²/s → µg/m³)
+//     Resolución: ~0.5° × 0.625° | Período: 1980–presente
+//     Referencia informe: Sección 6.3 (modelos de transporte)
+// ─────────────────────────────────────────────────────────────
+// NOTA: MERRA-2 aerosol surface mass concentration
+// Colección GEE: NASA/GSFC/MERRA/aer/2
+var merra2 = ee.ImageCollection('NASA/GSFC/MERRA/aer/2')
+  .filterDate(startDate, endDate)
+  .filterBounds(aoi)
+  .select([
+    'BCSMASS',   // Black Carbon
+    'DUSMASS25', // Dust PM2.5
+    'OCSMASS',   // Organic Carbon
+    'SO4SMASS',  // Sulfate
+    'SSSMASS25'  // Sea Salt PM2.5
+  ]);
+
+// PM2.5 total MERRA-2 = suma de componentes (kg/m³ → µg/m³ ×1e9)
+var merra2_pm25 = merra2.map(function(img) {
+  var pm25 = img.select('BCSMASS')
+    .add(img.select('DUSMASS25'))
+    .add(img.select('OCSMASS'))
+    .add(img.select('SO4SMASS'))
+    .add(img.select('SSSMASS25'))
+    .multiply(1e9)
+    .rename('pm25_ug_m3');
+  return pm25.copyProperties(img, ['system:time_start', 'system:time_end']);
+});
+
+// Serie temporal anual MERRA-2
+var merra2Annual = ee.List.sequence(startYear, endYear).map(function(year) {
+  var y = ee.Number(year);
+  var col = merra2_pm25.filter(ee.Filter.calendarRange(y, y, 'year'));
+  var mean = col.mean().clip(aoi);
+  var stats = mean.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 55000,
+    maxPixels: 1e13
+  });
+  return ee.Feature(null, {
+    'year': y,
+    'pm25_mean_ug_m3': stats.get('pm25_ug_m3'),
+    'source': 'MERRA2'
+  });
+});
+print('MERRA-2 — PM2.5 anual medio Paraguay (2001–2025):', merra2Annual);
+
+// Mapa PM2.5 MERRA-2 promedio
+var merra2Mean = merra2_pm25.mean().clip(aoi);
+Map.addLayer(merra2Mean,
+  {min: 0, max: 20, palette: pm25Palette},
+  'PM2.5 promedio MERRA-2 2001–2025 (µg/m³)');
+
+// ─────────────────────────────────────────────────────────────
+// 5. ANÁLISIS ESTACIONAL — PM2.5 por MESES (MERRA-2)
+//    Hipótesis del informe: picos PM2.5 en período seco (mayo–oct)
+//    coinciden con período de heladas y quemas (Sección 7.2)
+// ─────────────────────────────────────────────────────────────
+var monthlyPM25 = ee.List.sequence(1, 12).map(function(month) {
+  var m = ee.Number(month);
+  var col = merra2_pm25.filter(ee.Filter.calendarRange(m, m, 'month'));
+  var mean = col.mean().clip(aoi);
+  var stats = mean.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 55000,
+    maxPixels: 1e13
+  });
+  return ee.Feature(null, {
+    'month': m,
+    'pm25_mean_ug_m3': stats.get('pm25_ug_m3'),
+    'source': 'MERRA2'
+  });
+});
+print('Distribución mensual PM2.5 MERRA-2 (2001–2025):', monthlyPM25);
+
+// ─────────────────────────────────────────────────────────────
+// 6. PM2.5 POR ECORREGIÓN — MERRA-2 (promedio período completo)
+// ─────────────────────────────────────────────────────────────
+var ecoList = [
+  {id: 'NT1301', name: 'Chaco_Seco'},
+  {id: 'NT0907', name: 'Chaco_Humedo'},
+  {id: 'NT0704', name: 'Cerrado'},
+  {id: 'NT0102', name: 'BAAPA'},
+  {id: 'NT0139', name: 'Pantanal'}
+];
+
+var ecoStats = ecoList.map(function(eco) {
+  var ecoGeom = ecoregions
+    .filter(ee.Filter.eq('ECO_ID', eco.id))
+    .geometry()
+    .intersection(aoi);
+
+  var stats = merra2Mean.reduceRegion({
+    reducer: ee.Reducer.mean().combine({
+      reducer2: ee.Reducer.stdDev(),
+      sharedInputs: true
+    }),
+    geometry: ecoGeom,
+    scale: 55000,
+    maxPixels: 1e13
+  });
+  return ee.Feature(null, {
+    'eco_id': eco.id,
+    'eco_name': eco.name,
+    'pm25_mean_ug_m3': stats.get('pm25_ug_m3_mean'),
+    'pm25_sd_ug_m3': stats.get('pm25_ug_m3_stdDev'),
+    'source': 'MERRA2_2001_2025'
+  });
+});
+print('PM2.5 por ecorregión (MERRA-2, promedio 2001–2025):',
+  ee.FeatureCollection(ecoStats));
+
+// ─────────────────────────────────────────────────────────────
+// 7. ANÁLISIS PERÍODO INVERNAL (MAYO–OCTUBRE)
+//    Correlación con período de heladas DINAC (Sección 4.1)
+//    Año pico heladas: 2021 (47 días-estación) — verificar PM2.5
+// ─────────────────────────────────────────────────────────────
+// PM2.5 período invernal por año
+var winterPM25 = ee.List.sequence(startYear, endYear).map(function(year) {
+  var y = ee.Number(year);
+  // Mayo (5) a Octubre (10) — período seco-invernal Paraguay
+  var col = merra2_pm25
+    .filter(ee.Filter.calendarRange(y, y, 'year'))
+    .filter(ee.Filter.calendarRange(5, 10, 'month'));
+  var mean = col.mean().clip(aoi);
+  var stats = mean.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: aoi,
+    scale: 55000,
+    maxPixels: 1e13
+  });
+  return ee.Feature(null, {
+    'year': y,
+    'period': 'Mayo-Octubre',
+    'pm25_winter_mean_ug_m3': stats.get('pm25_ug_m3'),
+    'source': 'MERRA2'
+  });
+});
+print('PM2.5 período invernal (mayo–oct) por año 2001–2025:', winterPM25);
+
+// ─────────────────────────────────────────────────────────────
+// 8. UMBRALES OMS — CLASIFICACIÓN DE EXPOSICIÓN
+//    OMS Guía 2021: PM2.5 anual ≤ 5 µg/m³ (meta final)
+//    Niveles intermedios: IT-1=35, IT-2=25, IT-3=15, IT-4=10 µg/m³
+//    Referencia informe: Sección 7.2, ref. 147
+// ─────────────────────────────────────────────────────────────
+var pm25_who = merra2Mean;
+
+// Clasificación por umbral OMS
+var exposure = pm25_who
+  .where(pm25_who.lte(5),   1)   // Meta OMS 2021
+  .where(pm25_who.gt(5).and(pm25_who.lte(10)),  2)  // IT-4
+  .where(pm25_who.gt(10).and(pm25_who.lte(15)), 3)  // IT-3
+  .where(pm25_who.gt(15).and(pm25_who.lte(25)), 4)  // IT-2
+  .where(pm25_who.gt(25).and(pm25_who.lte(35)), 5)  // IT-1
+  .where(pm25_who.gt(35), 6)                         // Excede IT-1
+  .clip(aoi).rename('who_exposure_level');
+
+Map.addLayer(exposure,
+  {min: 1, max: 6, palette: ['#00e400','#ffff00','#ff7e00','#ff0000','#8f3f97','#7e0023']},
+  'Nivel exposición OMS PM2.5 (MERRA-2 2001–2025)');
+
+print('Clasificación exposición OMS:');
+print('1 = ≤5 µg/m³ (Meta OMS 2021)');
+print('2 = 5–10 µg/m³ (IT-4)');
+print('3 = 10–15 µg/m³ (IT-3)');
+print('4 = 15–25 µg/m³ (IT-2)');
+print('5 = 25–35 µg/m³ (IT-1)');
+print('6 = >35 µg/m³ (Excede IT-1)');
+
+// ─────────────────────────────────────────────────────────────
+// 9. EXPORTAR RESULTADOS A GOOGLE DRIVE
+// ─────────────────────────────────────────────────────────────
+
+// 9a. Raster PM2.5 promedio MERRA-2 (2001–2025)
+Export.image.toDrive({
+  image: merra2Mean.toFloat(),
+  description: 'Paraguay_PM25_MERRA2_mean_2001_2025',
+  folder: 'GEE_Paraguay_PM25',
+  fileNamePrefix: 'pm25_merra2_mean_2001_2025',
+  region: aoi,
+  scale: 25000,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// 9b. Raster PM2.5 ACAG promedio (2001–2022)
+Export.image.toDrive({
+  image: acagMean.toFloat(),
+  description: 'Paraguay_PM25_ACAG_mean_2001_2022',
+  folder: 'GEE_Paraguay_PM25',
+  fileNamePrefix: 'pm25_acag_mean_2001_2022_1km',
+  region: aoi,
+  scale: 1000,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// 9c. Raster clasificación OMS
+Export.image.toDrive({
+  image: exposure.toInt(),
+  description: 'Paraguay_PM25_WHO_Exposure_MERRA2_2001_2025',
+  folder: 'GEE_Paraguay_PM25',
+  fileNamePrefix: 'pm25_who_exposure_level_2001_2025',
+  region: aoi,
+  scale: 25000,
+  crs: 'EPSG:4326',
+  maxPixels: 1e13
+});
+
+// 9d. Serie anual MERRA-2 (CSV)
+Export.table.toDrive({
+  collection: ee.FeatureCollection(merra2Annual),
+  description: 'Paraguay_PM25_MERRA2_Annual_2001_2025',
+  folder: 'GEE_Paraguay_PM25',
+  fileNamePrefix: 'pm25_merra2_annual_2001_2025',
+  fileFormat: 'CSV'
+});
+
+// 9e. Serie anual ACAG (CSV)
+Export.table.toDrive({
+  collection: ee.FeatureCollection(acagAnnual),
+  description: 'Paraguay_PM25_ACAG_Annual_2001_2022',
+  folder: 'GEE_Paraguay_PM25',
+  fileNamePrefix: 'pm25_acag_annual_2001_2022',
+  fileFormat: 'CSV'
+});
+
+// 9f. PM2.5 período invernal (CSV)
+Export.table.toDrive({
+  collection: ee.FeatureCollection(winterPM25),
+  description: 'Paraguay_PM25_Winter_MERRA2_2001_2025',
+  folder: 'GEE_Paraguay_PM25',
+  fileNamePrefix: 'pm25_winter_mayo_oct_2001_2025',
+  fileFormat: 'CSV'
+});
+
+// 9g. PM2.5 por ecorregión (CSV)
+Export.table.toDrive({
+  collection: ee.FeatureCollection(ecoStats),
+  description: 'Paraguay_PM25_by_Ecoregion_MERRA2_2001_2025',
+  folder: 'GEE_Paraguay_PM25',
+  fileNamePrefix: 'pm25_by_ecoregion_2001_2025',
+  fileFormat: 'CSV'
+});
+
+// 9h. Serie mensual MERRA-2 (CSV)
+Export.table.toDrive({
+  collection: ee.FeatureCollection(monthlyPM25),
+  description: 'Paraguay_PM25_Monthly_MERRA2_2001_2025',
+  folder: 'GEE_Paraguay_PM25',
+  fileNamePrefix: 'pm25_monthly_2001_2025',
+  fileFormat: 'CSV'
+});
+
+// ─────────────────────────────────────────────────────────────
+// 10. METADATOS EN CONSOLA
+// ─────────────────────────────────────────────────────────────
+print('=== METADATOS DEL ANÁLISIS PM2.5 ===');
+print('Período: 2001 – 2025');
+print('Colecciones usadas:');
+print('  A) projects/sat-io/open-datasets/ACAG/PM25-annual (1km anual, 2001–2022)');
+print('     van Donkelaar et al. (2021) — Environ Sci Technol');
+print('  B) ECMWF/CAMS/NRT (NRT, ~80km, 2016–2025)');
+print('     Inness et al. (2019) — Atmos Chem Phys 19:3515–3556');
+print('  C) COPERNICUS/S5P/OFFL/L3_AER_AI (3.5km, 2018–2025)');
+print('     Veefkind et al. (2012) — Remote Sens Environ 120:70–83');
+print('  D) NASA/GSFC/MERRA/aer/2 (0.5°×0.625°, 2001–2025)');
+print('     Gelaro et al. (2017) — J Climate 30:5419–5454');
+print('Ecorregiones Olson 2001: NT1301, NT0907, NT0704, NT0102, NT0139');
+print('Umbral OMS 2021: 5 µg/m³ (meta anual PM2.5)');
+print('Referencia: Informe Revisión Sistemática DINAC — Sección 6.3, 7.2');
+print('ACAG Dataset: https://sites.wustl.edu/acag/datasets/surface-pm2-5/');
+print('CAMS: https://ads.atmosphere.copernicus.eu/');
+
+// ─────────────────────────────────────────────────────────────
+// FIN DEL SCRIPT 2
+// ─────────────────────────────────────────────────────────────
